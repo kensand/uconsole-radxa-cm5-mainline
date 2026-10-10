@@ -1,236 +1,247 @@
 # Arch Linux ARM install — uConsole + Radxa CM5 (7.2.9 mainline, no WM)
 
-Switching the microSD base from the Debian/RX image to **Arch Linux ARM** on a
-**blank microSD card**, with the **7.2.9-dirty mainline kernel** and **Radxa's
-U-Boot SPL** (written from the stock CLI image). Follows the repo's recommended
-Arch path
-([kernel-guide.md](kernel-guide.md#step-9--install-the-arch-linux-arm-rootfs))
-with two deliberate deviations, called out where they happen:
+Switching the microSD base to **Arch Linux ARM**, keeping the **7.2.9-dirty
+mainline kernel** from this repo. **Approach: flash the full RX image, then swap
+the OS in place.**
 
-1. **Blank SD card; Radxa U-Boot SPL written from the stock image.** The CM5
-   will not boot an SD without U-Boot in the raw first 16 MiB, so we write the
-   guide's Step 8 — the first 16 MiB of the RX image
-   (`ClockworkRadxa-Debian-12-Bookworm-lite-6.1.84.img.xz`, on the host at
-   `~/Downloads/`). No preservation needed because the card starts empty.
-2. **Install the 7.2.9 mainline kernel, not the guide's 6.1 build.** We already
-   built it and it drives the TXW500170B0-BL panel + AIO v2. No dev-null2019
-   overlays — the AIO DTB bakes all of that in.
+> ## Why not hand-assemble the boot layout? (2026-10-10 lesson)
+>
+> The original plan was: blank card → `parted` GPT → `mkfs` → `dd` the first
+> 16 MiB of the RX image (U-Boot SPL) → Arch rootfs. **That is unreliable on
+> this hardware.** The RX/Radxa SD image's GPT is *not* a standard
+> GPT-at-offset-0 layout: its on-disk GPT header at 0x200 carries scrambled /
+> relocated LBA fields (current-LBA points into the multi-GB range, first-usable
+> > last-usable), and U-Boot does not find the boot partition from a naive
+> `parted`-created GPT. Hand-replicating that byte layout with `parted` + `dd`
+> produces a table the SPL may not understand, and without the device in front
+> of us we can't debug a boot failure.
+>
+> **So: flash the whole RX image** (its SPL + partition layout + U-Boot + a
+> booting Debian rootfs are all proven-good for this exact board), boot it, then
+> **replace only the root filesystem with Arch** and add the 7.2.9 kernel. The
+> boot-critical bits (SPL, GPT, U-Boot) come from the image verbatim; we never
+> hand-write them.
 
-> **Rollback first.** Before running anything below, the Debian state must be
-> backed up (it is: `~/Work/uconsole-backups/uconsole-debian-7.2.9-backup.tar.gz`,
-> and the full procedure is in
+> **Rollback first.** The Debian state is already backed up:
+> `~/Work/uconsole-backups/uconsole-debian-7.2.9-backup.tar.gz` (procedure in
 > [rx-image-session-log.md §8b](rx-image-session-log.md#8b-rollback-how-to-get-back-to-this-debian-state)).
-> Do not proceed to Step 2 until that tarball is confirmed on the host.
 
-**Host tools** (this PC): `parted mkfs.ext4 bsdtar wget dd xz rsync` are enough.
-The guide's `sgdisk` is not installed; `parted` is used for the GPT label instead.
+**Host tools** (this PC): `dd xz lsblk`. On the device after boot: `pacman`,
+`rsync`, `blkid`.
 
 ---
 
-## Step 1 — Identify the SD card (do not skip)
+## Phase A — Flash the full RX image (proven-good boot)
+
+### A1. Identify the SD card (do not skip)
 
 ```bash
 lsblk
-# confirm which /dev/sdX is the uConsole's card (by size, and that it currently
-# holds the Debian system: mmcblk-style partitions, the RX labels, etc.)
-export SD=/dev/sdX          # EDIT THIS to your real device
+export SD=/dev/sdX        # EDIT: the uConsole card, by size. Confirm it's the
+                          # one you mean to wipe (currently the 476G SanDisk).
 echo "target: $SD"
 ```
 
-Everything below wipes and rewrites `$SD`. **If you get the device wrong you
-destroy that disk.** Double-check against `lsblk` and `lsblk -o NAME,SIZE,LABEL`.
-
-## Step 2 — (blank card: nothing to preserve)
-
-We start from a fresh card, so there is no U-Boot to save. (If you *had* chosen
-the in-place-card approach instead, you would have preserved the first 16 MiB
-before wiping — see the git history of this doc.)
-
-## Step 3 — Partition the card (GPT: 16 MiB gap, /boot, /root)
+### A2. Wipe + write the whole image
 
 ```bash
-sudo wipefs -a "$SD"
-sudo parted -s "$SD" mklabel gpt
-sudo parted -s "$SD" mkpart boot ext4 16MiB 528MiB
-sudo parted -s "$SD" mkpart root ext4 528MiB 100%
+IMG=~/Downloads/ClockworkRadxa-Debian-12-Bookworm-lite-6.1.84.img.xz
+ls -lh "$IMG"
 
-sudo mkfs.ext4 -L BOOT "${SD}1"
-sudo mkfs.ext4 -L ROOT "${SD}2"
-
-sudo mount "${SD}2" /mnt
-sudo mkdir -p /mnt/boot
-sudo mount "${SD}1" /mnt/boot
-```
-
-## Step 4 — Write U-Boot SPL to the raw start (from the Radxa image)
-
-The first 16 MiB of the Radxa CLI image contains the RK3588S ROM → U-Boot SPL
-→ U-Boot proper chain. Write it to the raw card (offset 0, does not touch the
-GPT that landed at 16 MiB):
-
-```bash
-# The RX image is the proven-correct U-Boot for this exact hardware. Its first
-# 16 MiB is byte-identical (same md5) to the Radxa b3 CLI image, so either works:
-RADXA_IMG=~/Downloads/ClockworkRadxa-Debian-12-Bookworm-lite-6.1.84.img.xz
-ls -lh "$RADXA_IMG"    # confirm it exists (694M)
-xzcat "$RADXA_IMG" | sudo dd of="$SD" bs=512 count=32768 conv=notrunc status=progress
+sudo umount "$SD"* 2>/dev/null          # unmount anything on it
+sudo dd if=/dev/zero of="$SD" bs=1M count=8 status=none   # clear old GPT quickly
 sync
+
+# full image write (this is the slow part — several minutes for 690M)
+xzcat "$IMG" | sudo dd of="$SD" bs=4M status=progress
+sync
+sudo partprobe "$SD" 2>/dev/null || true
+
+lsblk "$SD"          # should show the RX image's partitions (boot + root, Debian)
 ```
 
-> `count=32768` × 512 B = 16 MiB. Verified byte-identical to the guide's Step 8
-> (RX and Radxa-b3 images share the same first-16-MiB md5).
-> Any Radxa CM5 b3 image works — only the first 16 MiB is used.
+> `bs=4M` makes the write faster; the image is a byte-exact SD image so no
+> `count=` needed. If `dd` reports a short write or the card is busy, unplug/replug
+> and retry.
 
-## Step 5 — Install the Arch Linux ARM rootfs
+### A3. Boot the RX image (verify it works before touching it)
+
+Insert SD, **HDMI unplugged** (console goes to the panel), cold-start. Log in
+(`clockwork`/`clockwork` or the image default). Confirm:
 
 ```bash
+uname -r                 # 6.1.84+ (the RX kernel) — this is EXPECTED for now
+ip -br link              # eth0/end0 up
+```
+
+**Do not proceed until the RX image boots to a login.** This is the known-good
+baseline. If it doesn't boot, the card/write is wrong — re-do A2.
+
+---
+
+## Phase B — Swap the OS to Arch (on the booted RX system, over SSH)
+
+Everything below runs **on the device** (the booted RX system). We replace the
+Debian rootfs with Arch, keep the same `/boot` partition + U-Boot, and install
+the 7.2.9 kernel.
+
+> **This is destructive to the Debian rootfs** (it's what we're replacing). The
+> rollback backup (§8b) covers getting back to Debian.
+
+### B1. Get the Arch rootfs onto the card
+
+```bash
+# on the device:
+ROOT=$(findmnt -n -o SOURCE /)           # e.g. /dev/mmcblk0p3
+BOOT=$(findmnt -n -o SOURCE /boot)       # the ext4 boot partition
+echo "root=$ROOT boot=$BOOT"
+
+# download + extract Arch into a temp dir
 cd /tmp
 wget http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
-sudo bsdtar -xpf ArchLinuxARM-aarch64-latest.tar.gz -C /mnt
+mkdir -p /tmp/archroot
+bsdtar -xpf ArchLinuxARM-aarch64-latest.tar.gz -C /tmp/archroot
 ```
 
-Set `fstab` by UUID (root = `${SD}2`, boot = `${SD}1`):
+### B2. Move Arch onto the root partition
+
+We wipe the Debian rootfs and copy Arch in. (Same partition, so fstab/UUID stay
+valid and U-Boot's boot path is untouched.)
 
 ```bash
-ROOT_UUID=$(sudo blkid -s UUID -o value "${SD}2")
-BOOT_UUID=$(sudo blkid -s UUID -o value "${SD}1")
-sudo tee /mnt/etc/fstab <<EOF
-UUID=${ROOT_UUID}  /      ext4  rw,noatime  0 1
-UUID=${BOOT_UUID}  /boot  ext4  rw,noatime  0 2
-EOF
+# on the device — DESTRUCTIVE to the current rootfs:
+mount | grep -w "$ROOT" || { echo "root is the live fs; doing this online is unsafe — see note"; }
 ```
 
-## Step 6 — Install the 7.2.9 kernel, DTB, and modules
-
-The artifacts are on this host at `~/Work/uconsole-cm5-7.2.9/` (built from this
-repo, see [rx-image-session-log.md §1](rx-image-session-log.md#1-build-on-the-x8664-host)).
+> **Important:** replacing the rootfs of a *live* system is not straightforward
+> (busy filesystems). The clean way is to boot the RX system, then either:
+> (a) extract Arch over the running root and fix the few busy files on next boot,
+> or
+> (b) **chroot approach** — but the simplest reliable method is to do the swap
+> while the rootfs is not the running one.
+>
+> **Practical method used:** boot the RX system, download the Arch tarball, and
+> `rsync` it over `/` *excluding* the currently-mounted/volatile paths, then
+> reinstall the bootloader config. Files that are busy (running binaries, /proc,
+> /sys) are skipped and get corrected on the next cold boot. The kernel + U-Boot
+> + /boot are untouched, so if anything goes wrong the RX kernel still loads and
+> you can recover.
 
 ```bash
+# on the device — swap rootfs to Arch, keeping /boot, /dev, /proc, /sys, /run, /etc/machine-id:
+cd /tmp
+rsync -aHAX --delete \
+  --exclude '/boot' --exclude '/dev' --exclude '/proc' --exclude '/sys' \
+  --exclude '/run' --exclude '/etc/machine-id' --exclude '/root/.ssh' \
+  /tmp/archroot/ /
+```
+
+> `rsync --delete` makes `/` match Arch. `/boot` is preserved (still has the RX
+> kernel + the extlinux U-Boot reads). We'll add the 7.2.9 kernel to `/boot` next.
+> Keep `/root/.ssh` so you don't lock yourself out of SSH.
+
+### B3. Install the 7.2.9 kernel + DTB into /boot
+
+Copy the artifacts from the host to the device first (from the host PC):
+
+```bash
+# FROM THE HOST PC (not the device):
 A=~/Work/uconsole-cm5-7.2.9
-
-# kernel image
-sudo cp "$A/Image-7.2" /mnt/boot/Image
-
-# the AIO DTB (and the base DTB as a fallback) — we use prebuilt DTBs, no overlays
-sudo cp "$A/rk3588s-radxa-cm5-uconsole-aio.dtb" \
-       "$A/rk3588s-radxa-cm5-uconsole.dtb" /mnt/boot/
-
-# modules (staged tarball: contains lib/modules/7.2.9-dirty)
-mkdir -p /tmp/mods && tar xf "$A/modules-7.2.tar.gz" -C /tmp/mods
-sudo rsync -a /tmp/mods/lib/modules/7.2.9-dirty /mnt/usr/lib/modules/
+scp "$A/Image-7.2" "$A/rk3588s-radxa-cm5-uconsole-aio.dtb" \
+    "$A/rk3588s-radxa-cm5-uconsole.dtb" \
+    "$A/modules-7.2.tar.gz" \
+    clockwork@<device-ip>:/tmp/
 ```
 
-**Fallback if the card doesn't get past U-Boot at all** (SPL didn't take, or the
-raw write landed wrong): re-run Step 4. The Radxa image's first 16 MiB is the
-known-good bootloader for this exact board.
+```bash
+# ON THE DEVICE:
+cp /tmp/Image-7.2 /boot/Image-7.2
+cp /tmp/rk3588s-radxa-cm5-uconsole-aio.dtb /boot/
+cp /tmp/rk3588s-radxa-cm5-uconsole.dtb /boot/
+mkdir -p /tmp/mods && tar xf /tmp/modules-7.2.tar.gz -C /tmp/mods
+rsync -a /tmp/mods/lib/modules/7.2.9-dirty /usr/lib/modules/
+```
 
-## Step 7 — extlinux.conf
+### B4. extlinux.conf — add the Arch + 7.2.9 entry
 
-The U-Boot on this card reads `extlinux/extlinux.conf` from the **boot partition**
-(that's how the RX image was configured). Write it for the 7.2.9 kernel:
+The RX system's U-Boot reads `/boot/extlinux/extlinux.conf`. **Keep the existing
+RX entries** (so the 6.1.84 kernel remains an escape hatch) and add an Arch/7.2.9
+entry that points at the Arch root (same root partition, now holding Arch):
 
 ```bash
-sudo mkdir -p /mnt/boot/extlinux
-sudo tee /mnt/boot/extlinux/extlinux.conf <<'EOF'
-timeout 10
-default arch-72-aio
+# on the device:
+cp /boot/extlinux/extlinux.conf /boot/extlinux/extlinux.conf.rx-backup
+ROOT_PARTUUID=$(blkid -s PARTUUID -o value "$ROOT")
+cat >> /boot/extlinux/extlinux.conf <<EOF
 
 label arch-72-aio
   menu label Arch mainline 7.2.9 (AIO v2)
-  kernel /Image
+  kernel /Image-7.2
   fdt /rk3588s-radxa-cm5-uconsole-aio.dtb
-  append root=PARTUUID=__ROOT_PARTUUID__ rootfstype=ext4 rootwait rw console=tty1 consoleblank=0 loglevel=7 panic=10
-
-label arch-72-base
-  menu label Arch mainline 7.2.9 (base DTB, serial console)
-  kernel /Image
-  fdt /rk3588s-radxa-cm5-uconsole.dtb
-  append root=PARTUUID=__ROOT_PARTUUID__ rootfstype=ext4 rootwait rw console=ttyS4,1500000 console=tty1 consoleblank=0 loglevel=7 panic=10
+  append root=PARTUUID=$ROOT_PARTUUID rootfstype=ext4 rootwait rw console=tty1 consoleblank=0 loglevel=7 panic=10
 EOF
+# set it as default (keep the RX entry as fallback):
+sed -i 's/^default .*/default arch-72-aio/' /boot/extlinux/extlinux.conf
+cat /boot/extlinux/extlinux.conf
 ```
 
-Substitute the new card's root **PARTUUID** (not the old Debian one — it's a fresh
-partition):
+### B5. display-kick (REQUIRED, or first DSI enable wedges → grey screen)
 
 ```bash
-NEW_ROOT_PARTUUID=$(sudo blkid -s PARTUUID -o value "${SD}2")
-echo "$NEW_ROOT_PARTUUID"
-sudo sed -i "s/__ROOT_PARTUUID__/$NEW_ROOT_PARTUUID/" /mnt/boot/extlinux/extlinux.conf
-cat /mnt/boot/extlinux/extlinux.conf
+# on the device (the unit is already in the backup/repo; copy from /boot backup or host):
+cat > /etc/systemd/system/display-kick.service <<'EOF'
+[Unit]
+Description=Kick DSI panel (fixes grey screen on first enable)
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for i in 1 2 3; do echo 1 > /sys/class/backlight/*/bl_power 2>/dev/null; echo 1 > /sys/class/backlight/*/bl_power 2>/dev/null; sleep 0.5; done'
+RemainAfterExit=yes
+EOF
+systemctl enable display-kick.service
 ```
 
-> **Note on `console=ttyS4` in the base entry:** the *base* DTB keeps UART4 as a
-> serial console; the AIO DTB disables it (it's the amplifier-enable line). This
-> matches the Debian setup. If your preserved U-Boot expects a different
-> `extlinux` path or syntax, check the RX image's original file for reference —
-> it's in the backup tarball at `boot/extlinux/extlinux.conf`.
+(Adjust the `ExecStart` to match the actual working display-kick from the Debian
+system — it's in the backup tarball at `etc/systemd/system/display-kick.service`.
+Prefer restoring that exact file over the stub above.)
 
-## Step 8 — display-kick service (REQUIRED)
-
-Without this the first DSI enable at boot wedges → grey screen.
+### B6. Reboot into Arch + 7.2.9
 
 ```bash
-R=/home/kenny/git/uconsole-radxa-cm5-mainline/runtime
-sudo install -m 644 "$R/display-kick.service" /mnt/etc/systemd/system/
-# enable it by creating the symlink (can't systemctl on a chroot-less mount)
-sudo mkdir -p /mnt/etc/systemd/system/multi-user.target.wants
-sudo ln -s /etc/systemd/system/display-kick.service \
-  /mnt/etc/systemd/system/multi-user.target.wants/display-kick.service
+reboot
 ```
 
-## Step 9 — Unmount and boot
+After reboot, verify:
 
 ```bash
-sudo umount /mnt/boot
-sudo umount /mnt
-sync
+uname -r                 # 7.2.9-dirty
+cat /etc/os-release | head -1   # Arch Linux
+dmesg | grep cwu50         # panel: TXW500170B0-BL (new)
+dmesg | grep -i ocp8178
 ```
 
-Insert the SD into the uConsole (HDMI **unplugged**, so the console goes to the
-panel upright — see the rotation note in
-[rx-image-session-log.md §7](rx-image-session-log.md#7-the-rotated-console-gotcha-and-its-one-line-fix))
-and cold-start. Login: **`alarm` / `alarm`** (root: `root` / `root`).
+Login is now **`alarm`/`alarm`** (Arch default) — the Debian `clockwork` user is
+gone unless you recreate it.
 
-## Step 10 — Verify
+### B7. Post-boot
 
 ```bash
-uname -r                       # 7.2.9-dirty
-dmesg | grep cwu50             # panel: TXW500170B0-BL (new)
-dmesg | grep -i ocp8178        # OCP8178 one-wire backlight
-ip -br link                    # eth0/end0 up
-lsusb                          # keyboard/trackball hub
-```
-
-## Step 11 — Post-boot (on the device, via SSH)
-
-Minimal, no WM (per request). Add only what's needed:
-
-```bash
-# basic tooling
 sudo pacman -Syu
-sudo pacman -S --needed git base networkmanager iwd  # iwd if you use WiFi
-
-# GPU: panthor driver is built into the 7.2.9 kernel; Mesa for userspace
-sudo pacman -S --needed mesa
-# (no compositor yet — that's a later step when you want one; sway/labwc both
-#  read rotation=90 from the DTB and rotate automatically)
+sudo pacman -S --needed git base networkmanager mesa   # no WM (per request)
+# GPU: panthor is built into the 7.2.9 kernel; mesa gives userspace.
 ```
-
-**AIO v2** (when ready): the AIO DTB already enables GPS (UART2 → `/dev/ttyS2`)
-and RTC (I2C7). The `aio` rail tool + gpsd + rtl-sdr are the same as guide step 8.
 
 ---
 
 ## If it doesn't boot
 
-- **Black + no SSH:** the base-DTB entry (`arch-72-base`) carries a serial
-  console (`console=ttyS4,1500000`) — a 1.5 Mbps adapter on PIN_23/19/25 shows
-  the panic. Usual suspect: wrong `root=PARTUUID` in Step 7.
-- **Boots but panel dark/grey:** warm-reboot rather than cold (known MIPI
-  timing quirk), confirm `display-kick` is present (`systemctl cat display-kick`),
-  check `dmesg | grep -iE 'panel|dsi|ocp'`.
-- **U-Boot itself doesn't run:** the SPL write (Step 4) didn't take → re-run it,
-  and confirm `count=32768` bs=512 landed at offset 0 on the right `$SD`.
-- **Give up entirely:** restore the Debian state from the backup
-  ([rx-image-session-log.md §8b](rx-image-session-log.md#8b-rollback-how-to-get-back-to-this-debian-state)) —
-  re-flash the RX image or unpack the tarball onto a fresh partition layout.
+- **U-Boot loads but no kernel / drops to `=>`:** the `extlinux.conf` label is
+  wrong → the RX backup (`extlinux.conf.rx-backup`) still has the working 6.1.84
+  entry; revert `default` to it and boot the RX kernel, then fix the label.
+- **Boots RX 6.1.84 but not Arch 7.2.9:** the `arch-72-aio` label has a bad
+  `root=PARTUUID` or the kernel/DTB didn't land in `/boot` — check `ls /boot`.
+- **Panel dark/grey after Arch boot:** warm-reboot (MIPI timing quirk); confirm
+  `display-kick` is present and enabled.
+- **Give up:** restore Debian from the backup
+  ([rx-image-session-log.md §8b](rx-image-session-log.md#8b-rollback-how-to-get-back-to-this-debian-state)).

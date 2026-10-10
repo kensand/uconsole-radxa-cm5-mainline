@@ -9,9 +9,9 @@ with two deliberate deviations, called out where they happen:
 
 1. **Blank SD card; Radxa U-Boot SPL written from the stock image.** The CM5
    will not boot an SD without U-Boot in the raw first 16 MiB, so we write the
-   guide's Step 8 (first 16 MiB of `radxa-cm5-rpi-cm4-io_bookworm_cli_b3.output.img.xz`,
-   which is on the host at `~/Downloads/`). No preservation needed because the
-   card starts empty.
+   guide's Step 8 — the first 16 MiB of the RX image
+   (`ClockworkRadxa-Debian-12-Bookworm-lite-6.1.84.img.xz`, on the host at
+   `~/Downloads/`). No preservation needed because the card starts empty.
 2. **Install the 7.2.9 mainline kernel, not the guide's 6.1 build.** We already
    built it and it drives the TXW500170B0-BL panel + AIO v2. No dev-null2019
    overlays — the AIO DTB bakes all of that in.
@@ -69,15 +69,17 @@ The first 16 MiB of the Radxa CLI image contains the RK3588S ROM → U-Boot SPL
 GPT that landed at 16 MiB):
 
 ```bash
-RADXA_IMG=~/Downloads/radxa-cm5-rpi-cm4-io_bookworm_cli_b3.output.img.xz
-ls -lh "$RADXA_IMG"    # confirm it exists (690M)
+# The RX image is the proven-correct U-Boot for this exact hardware. Its first
+# 16 MiB is byte-identical (same md5) to the Radxa b3 CLI image, so either works:
+RADXA_IMG=~/Downloads/ClockworkRadxa-Debian-12-Bookworm-lite-6.1.84.img.xz
+ls -lh "$RADXA_IMG"    # confirm it exists (694M)
 xzcat "$RADXA_IMG" | sudo dd of="$SD" bs=512 count=32768 conv=notrunc status=progress
 sync
 ```
 
-> `count=32768` × 512 B = 16 MiB. This is byte-identical to the guide's Step 8.
-> If you don't have that image on hand, any Radxa CM5 b3 image works — only the
-> first 16 MiB is used.
+> `count=32768` × 512 B = 16 MiB. Verified byte-identical to the guide's Step 8
+> (RX and Radxa-b3 images share the same first-16-MiB md5).
+> Any Radxa CM5 b3 image works — only the first 16 MiB is used.
 
 ## Step 5 — Install the Arch Linux ARM rootfs
 

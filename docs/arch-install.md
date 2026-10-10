@@ -1,15 +1,17 @@
 # Arch Linux ARM install — uConsole + Radxa CM5 (7.2.9 mainline, no WM)
 
-Switching the microSD base from the Debian/RX image to **Arch Linux ARM**, keeping
-the **same 7.2.9-dirty mainline kernel** and **reusing the U-Boot already on the
-card**. Follows the repo's recommended Arch path
+Switching the microSD base from the Debian/RX image to **Arch Linux ARM** on a
+**blank microSD card**, with the **7.2.9-dirty mainline kernel** and **Radxa's
+U-Boot SPL** (written from the stock CLI image). Follows the repo's recommended
+Arch path
 ([kernel-guide.md](kernel-guide.md#step-9--install-the-arch-linux-arm-rootfs))
 with two deliberate deviations, called out where they happen:
 
-1. **No U-Boot reflash.** The SD already carries working U-Boot from the RX image.
-   We preserve it instead of the guide's "flash Radxa SPL" step. (If a boot ever
-   fails for bootloader reasons, the fallback is the guide's Step 8 — write the
-   first 16 MiB of a Radxa image to the raw card.)
+1. **Blank SD card; Radxa U-Boot SPL written from the stock image.** The CM5
+   will not boot an SD without U-Boot in the raw first 16 MiB, so we write the
+   guide's Step 8 (first 16 MiB of `radxa-cm5-rpi-cm4-io_bookworm_cli_b3.output.img.xz`,
+   which is on the host at `~/Downloads/`). No preservation needed because the
+   card starts empty.
 2. **Install the 7.2.9 mainline kernel, not the guide's 6.1 build.** We already
    built it and it drives the TXW500170B0-BL panel + AIO v2. No dev-null2019
    overlays — the AIO DTB bakes all of that in.
@@ -38,19 +40,11 @@ echo "target: $SD"
 Everything below wipes and rewrites `$SD`. **If you get the device wrong you
 destroy that disk.** Double-check against `lsblk` and `lsblk -o NAME,SIZE,LABEL`.
 
-## Step 2 — Preserve the existing U-Boot (16 MiB) before wiping
+## Step 2 — (blank card: nothing to preserve)
 
-The RK3588S ROM loads U-Boot SPL from the raw start of the card. Keep it:
-
-```bash
-# sanity: the card should already have a U-Boot SPL (from the RX image)
-sudo xxd -s 0x44000 -l 16 "$SD"      # expect some non-zero bootloader bytes
-sudo dd if="$SD" bs=512 count=32768 of=~/Work/uconsole-backups/sd-uboot-first16m.bin status=none
-ls -l ~/Work/uconsole-backups/sd-uboot-first16m.bin   # = 16777216 bytes
-```
-
-If that file is all zeros, the card has no bootable U-Boot in the first 16 MiB
-and you should stop and reconsider (see the fallback in Step 6).
+We start from a fresh card, so there is no U-Boot to save. (If you *had* chosen
+the in-place-card approach instead, you would have preserved the first 16 MiB
+before wiping — see the git history of this doc.)
 
 ## Step 3 — Partition the card (GPT: 16 MiB gap, /boot, /root)
 
@@ -68,12 +62,22 @@ sudo mkdir -p /mnt/boot
 sudo mount "${SD}1" /mnt/boot
 ```
 
-## Step 4 — Write the preserved U-Boot back to the raw start
+## Step 4 — Write U-Boot SPL to the raw start (from the Radxa image)
+
+The first 16 MiB of the Radxa CLI image contains the RK3588S ROM → U-Boot SPL
+→ U-Boot proper chain. Write it to the raw card (offset 0, does not touch the
+GPT that landed at 16 MiB):
 
 ```bash
-sudo dd if=~/Work/uconsole-backups/sd-uboot-first16m.bin of="$SD" bs=512 conv=notrunc status=progress
+RADXA_IMG=~/Downloads/radxa-cm5-rpi-cm4-io_bookworm_cli_b3.output.img.xz
+ls -lh "$RADXA_IMG"    # confirm it exists (690M)
+xzcat "$RADXA_IMG" | sudo dd of="$SD" bs=512 count=32768 conv=notrunc status=progress
 sync
 ```
+
+> `count=32768` × 512 B = 16 MiB. This is byte-identical to the guide's Step 8.
+> If you don't have that image on hand, any Radxa CM5 b3 image works — only the
+> first 16 MiB is used.
 
 ## Step 5 — Install the Arch Linux ARM rootfs
 
@@ -114,15 +118,9 @@ mkdir -p /tmp/mods && tar xf "$A/modules-7.2.tar.gz" -C /tmp/mods
 sudo rsync -a /tmp/mods/lib/modules/7.2.9-dirty /mnt/usr/lib/modules/
 ```
 
-**Fallback if the preserved U-Boot fails to boot** (Step 2's file was zeroed or
-corrupt): write the first 16 MiB of a Radxa image to the raw card, then re-run
-from Step 3:
-
-```bash
-# only if needed:
-xzcat ~/Downloads/radxa-cm5-rpi-cm4-io_bookworm_cli_b3.output.img.xz \
-  | sudo dd of="$SD" bs=512 count=32768 conv=notrunc status=progress
-```
+**Fallback if the card doesn't get past U-Boot at all** (SPL didn't take, or the
+raw write landed wrong): re-run Step 4. The Radxa image's first 16 MiB is the
+known-good bootloader for this exact board.
 
 ## Step 7 — extlinux.conf
 
@@ -229,8 +227,8 @@ and RTC (I2C7). The `aio` rail tool + gpsd + rtl-sdr are the same as guide step 
 - **Boots but panel dark/grey:** warm-reboot rather than cold (known MIPI
   timing quirk), confirm `display-kick` is present (`systemctl cat display-kick`),
   check `dmesg | grep -iE 'panel|dsi|ocp'`.
-- **U-Boot itself doesn't run:** the preserved 16 MiB was bad → use the Step 6
-  fallback (flash Radxa SPL) and re-partition.
+- **U-Boot itself doesn't run:** the SPL write (Step 4) didn't take → re-run it,
+  and confirm `count=32768` bs=512 landed at offset 0 on the right `$SD`.
 - **Give up entirely:** restore the Debian state from the backup
   ([rx-image-session-log.md §8b](rx-image-session-log.md#8b-rollback-how-to-get-back-to-this-debian-state)) —
   re-flash the RX image or unpack the tarball onto a fresh partition layout.

@@ -342,6 +342,19 @@ no `nvme0`. There is also a **116G eMMC** (`mmcblk1`) present. Re-check the NVMe
 link under the 7.2.9 kernel (correct `pcie2x1l2`/PERST# in the DTB) — it may link
 there. See Next steps §4.
 
+**pacman + Landlock:** Arch's pacman 7 sandboxes its download step with Landlock
+and hard-fails on a kernel without `CONFIG_SECURITY_LANDLOCK` ("restricting
+filesystem access failed because Landlock is not supported" / "switching to
+sandbox user 'alpm' failed"). We did **not** rebuild the kernel with Landlock
+(the incremental Landlock Image built and even booted, but it was the step that
+correlated with the broken-boot scare, so we kept the known-good kernel). Fix:
+`DisableSandbox` in the **global** section of `/etc/pacman.conf` — it must be at
+the top of the file, *before* any `[repo]`/`[aur]` header; appended at the bottom
+it lands in the `[aur]` section and pacman reports "directive 'DisableSandbox' in
+section 'aur' not recognized" and ignores it. (Do **not** delete the `alpm` user
+— that's a different, worse failure; see pacman MR !250.) After that,
+`pacman -Syu` works.
+
 ---
 
 *The general-purpose, image-agnostic version of this is [sd-boot-guide.md](sd-boot-guide.md).*

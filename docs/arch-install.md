@@ -181,10 +181,25 @@ dmesg | grep -iE 'nvme|pcie|LTSSM|Link'
 
 ### B9. Post-boot
 ```bash
-sudo pacman -Syu
-sudo pacman -S --needed git base networkmanager mesa   # no WM (per request)
+# pacman 7 sandboxes its downloads with Landlock; our 7.2.9 kernel does NOT
+# enable CONFIG_SECURITY_LANDLOCK, so pacman hard-fails with
+#   "restricting filesystem access failed because Landlock is not supported"
+#   "switching to sandbox user 'alpm' failed"
+# Fix: DisableSandbox in the GLOBAL section of /etc/pacman.conf (top of file,
+# BEFORE any [repo]/[aur] header — under a section it is "not recognized").
+grep -q '^DisableSandbox' /etc/pacman.conf || sed -i '1i DisableSandbox' /etc/pacman.conf
+pacman -Syu
+pacman -S --needed git base networkmanager mesa   # no WM (per request)
 # GPU: panthor is built into the 7.2.9 kernel; mesa gives userspace.
 ```
+
+> **Why not just enable Landlock in the kernel?** `CONFIG_SECURITY_LANDLOCK=y`
+> is the "proper" fix (it's a one-line config), and a Landlock-enabled Image
+> builds and *boots*. But the incremental rebuild was the step that correlated
+> with a broken boot during this session, so the safe call was to keep the
+> known-good kernel and disable pacman's sandbox in userspace instead. If you
+> ever rebuild the kernel from scratch (full build script, not a hand `make`),
+> add `CONFIG_SECURITY_LANDLOCK=y` and drop the `DisableSandbox` line.
 
 ---
 
@@ -199,6 +214,7 @@ sudo pacman -S --needed git base networkmanager mesa   # no WM (per request)
 | Live swap: `head/clear/pgrep: cannot execute` | replaced `/usr` under a running system | **swap offline** (uConsole off) |
 | "cannot open root device" (UUID) | 7.2.9 kernel couldn't resolve `root=UUID=` | use `root=PARTUUID=` |
 | backlight on, black screen, fan 100%, boot stalls | kernel hung (usually the root-device issue above) | fix `root=PARTUUID=`; if still stuck, boot with HDMI in and read the console |
+| `pacman`: "Landlock is not supported by the kernel" / "switching to sandbox user 'alpm' failed" | pacman 7 sandboxes downloads with Landlock; kernel lacks `CONFIG_SECURITY_LANDLOCK` | add `DisableSandbox` to the **global** section of `/etc/pacman.conf` (top of file, before any `[repo]`/`[aur]` — under a section it's "not recognized"). Do **not** delete the `alpm` user (that breaks it differently). |
 
 ## If it doesn't boot
 - **U-Boot loads, no kernel / `=>` prompt:** `extlinux.conf` label/path wrong —

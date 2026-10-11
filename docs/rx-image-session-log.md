@@ -291,14 +291,56 @@ change the boot experience.
 | Emergency entry | RX 6.1.84 (`l0`/`l0r`) — intact, panel dark but boots + HDMI + SSH |
 | display-kick.service | enabled |
 | Boot-config manager | **Radxa BSP is present** (`u-boot-menu` + `rsetup` + `radxa-*` layer) — see §8a |
-| Gold backup | **to be made before the Arch install** (§8b) — tarball of /boot /etc /root + mainline modules |
-| **Not done** | AIO v2 bring-up (`aio`, gpsd, rtl-sdr); **switch base to Arch Linux ARM** (chosen over the Trixie upgrade, §8a) |
+| Gold backup | **made** — `~/Work/uconsole-backups/uconsole-debian-7.2.9-backup.tar.gz` (141M, on host) |
+| **Base OS** | **Arch Linux ARM + 7.2.9-dirty mainline** (swapped from Debian, §10) |
+| **Not done** | AIO v2 bring-up (`aio`, gpsd, rtl-sdr); NVMe PCIe link (fails on 6.1.84, LTSSM 0x2 — re-check under 7.2.9) |
 
 ### Next steps
-1. **Back up the Debian state** (§8b) to a USB stick / host PC — *before* touching the SD for Arch. This is the rollback path.
-2. **Arch Linux ARM install** (chosen path, replaces the deferred Trixie upgrade): flash a vanilla archlinuxarm aarch64 image to the SD, reuse the existing U-Boot, copy in the same three kernel artifacts (§3), `pacman -S` the runtime bits (mesa/panthor for GPU, the `display-kick` service). No Radxa BSP layer → none of the §8a traps. No WM to start (per request).
+1. ~~Back up the Debian state~~ **done** (§8b) — tarball on the host.
+2. ~~Arch Linux ARM install~~ **done** (§10) — full RX image flash + offline rootfs swap + 7.2.9 kernel, `root=PARTUUID=`.
 3. AIO v2 bring-up (guide step 8): `aio` tool, `aio-rails.service`, gpsd on `/dev/ttyS2`, rtl-sdr.
-4. Optional: the LoRa one-wire fix (aio-v2.md) for `/dev/spidev5.0`.
+4. **NVMe:** the PCIe link failed on the 6.1.84 RX kernel (`LTSSM 0x2`, no receiver). The 7.2.9 DTB has the correct `pcie2x1l2` + PERST# wiring — re-check `lsblk`/`dmesg | grep -iE 'nvme|LTSSM|Link'` under 7.2.9; if it links, move root to NVMe (or the 116G eMMC `mmcblk1`).
+5. Optional: the LoRa one-wire fix (aio-v2.md) for `/dev/spidev5.0`.
+
+---
+
+## 10. Switching the base to Arch Linux ARM (2026-10-10, second half)
+
+Chose Arch over the Trixie upgrade (§8a). Full write-up: [arch-install.md](arch-install.md).
+The short version of what actually took, and what wasted time:
+
+**What worked (the final method):**
+1. Flash the **full RX image** to the SD (proven SPL+GPT+U-Boot+Debian rootfs).
+2. **Offline** swap (uConsole off, SD in the host's reader): `find /mnt -mindepth 1
+   -maxdepth 1 -exec rm -rf {} +` to wipe the ext4 root (`sda3`) contents, then
+   `cp -a /tmp/archroot/. /mnt/`.
+3. Drop the 7.2.9 `Image` + AIO DTB into the rootfs's `/boot`, modules into
+   `/usr/lib/modules`.
+4. `extlinux.conf` with **`root=PARTUUID=`** (not `root=UUID=`) + display-kick.
+5. Boot → **Arch Linux ARM + 7.2.9-dirty**, panel up.
+
+**What failed / cost time (so it isn't repeated):**
+- **Hand-assembled boot layout** (blank card + `parted` GPT + `dd` first 16 MiB
+  SPL): the RX image's GPT is not a standard GPT-at-0 (scrambled LBA fields);
+  a naive `parted` table isn't found by U-Boot. Abandoned → flash the whole image.
+- **Live `rsync --delete` swap** on the running Debian system: replaced `/usr`
+  under a live system → most commands stopped working (`head`/`ls`/`cat`:
+  "required file not found"). Re-flashed and did the swap **offline** instead.
+- **`root=UUID=`** → "cannot open root device" at boot (UUID was correct per
+  `blkid`). **`root=PARTUUID=`** fixed it — matches the original Debian 7.2.9 setup.
+- **zsh gotchas:** `rm -rf /mnt/* /mnt/.*` aborts the whole line in zsh when a
+  glob matches nothing (`no matches found`); use the `find -exec rm -rf` form.
+- **Mount shadowing:** the empty FAT `sda2` mounted at `/mnt/boot` hid the ext4
+  rootfs's real `/boot`; `umount /mnt/boot` to see it.
+- **The RX image's real layout** (not the hand-rolled one): `sda1` 16M vfat
+  "config", `sda2` 300M vfat "efi" (empty), `sda3` 476G ext4 "rootfs" (root +
+  `/boot`). The kernel + `extlinux.conf` live on **`sda3`'s `/boot`**, not the FAT.
+
+**NVMe observation:** on the 6.1.84 RX kernel the HackerGadgets NVMe board's
+PCIe link failed (`rk-pcie ... PCIe Link Fail, LTSSM is 0x2` = no receiver), so
+no `nvme0`. There is also a **116G eMMC** (`mmcblk1`) present. Re-check the NVMe
+link under the 7.2.9 kernel (correct `pcie2x1l2`/PERST# in the DTB) — it may link
+there. See Next steps §4.
 
 ---
 
